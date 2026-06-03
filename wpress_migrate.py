@@ -507,9 +507,11 @@ def search_replace(cfg: DBConfig, old: bytes, new: bytes, dry_run: bool = False,
     """Serialization-safe replace of old->new across all text columns.
 
     Reads every table in primary-key-ordered batches (keyset pagination) instead
-    of buffering whole tables into client memory. This is what lets it run on a
-    multi-GB database: memory stays bounded to one batch, and no single query is
-    held open long enough to be killed. Returns the number of cells changed.
+    of buffering a whole table into client memory at once. PyMySQL materializes
+    every row as Python objects, which inflates the raw bytes several-fold — so
+    even a few-hundred-MB table can exhaust a small server (swap, then an
+    OOM-killed query). Keyset pagination bounds memory to one page and keeps each
+    query short. Returns the number of cells changed.
     """
     conn = _connect(cfg)
     changed_cells = 0
