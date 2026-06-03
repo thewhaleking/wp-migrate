@@ -490,10 +490,26 @@ def _ident(name: bytes) -> str:
     return "`" + s.replace("`", "``") + "`"
 
 
-def search_replace(cfg: DBConfig, old: bytes, new: bytes, dry_run: bool = False) -> int:
+def _cell_updates(columns, col_vals, old: bytes, new: bytes) -> dict:
+    """Return {column: new_bytes} for the cells in one row that changed."""
+    updates = {}
+    for col, val in zip(columns, col_vals):
+        if val is None or old not in val:
+            continue
+        new_val = replace_serialized(val, old, new)
+        if new_val != val:
+            updates[col] = new_val
+    return updates
+
+
+def search_replace(cfg: DBConfig, old: bytes, new: bytes, dry_run: bool = False,
+                   batch: int = 1000) -> int:
     """Serialization-safe replace of old->new across all text columns.
 
-    Returns the number of cells changed.
+    Reads every table in primary-key-ordered batches (keyset pagination) instead
+    of buffering whole tables into client memory. This is what lets it run on a
+    multi-GB database: memory stays bounded to one batch, and no single query is
+    held open long enough to be killed. Returns the number of cells changed.
     """
     conn = _connect(cfg)
     changed_cells = 0
@@ -503,36 +519,40 @@ def search_replace(cfg: DBConfig, old: bytes, new: bytes, dry_run: bool = False)
             targets = list(_string_columns(meta, cfg.database))
 
         for table, columns, pk in targets:
+            tdec = table.decode()
             if not pk:
-                print(f"  ! skipping {table.decode()} (no primary key)", file=sys.stderr)
+                print(f"  ! skipping {tdec} (no primary key)", file=sys.stderr)
                 continue
+            print(f"  scanning {tdec} ...", file=sys.stderr)
 
             tname = _ident(table)
             pk_idents = [_ident(c) for c in pk]
+            order = ", ".join(pk_idents)
             select_cols = ", ".join(pk_idents + [_ident(c) for c in columns])
+            # Row-value comparison `(pk...) > (?...)` resumes after the last row
+            # of the previous batch, seeking via the PK index — works for single
+            # and composite keys alike.
+            keyset = "(" + order + ") > (" + ", ".join(["%s"] * len(pk)) + ")"
+            last: tuple | None = None
 
             with conn.cursor() as read, conn.cursor() as write:
-                read.execute(f"SELECT {select_cols} FROM {tname}")
                 while True:
-                    rows = read.fetchmany(500)
+                    if last is None:
+                        read.execute(f"SELECT {select_cols} FROM {tname} "
+                                     f"ORDER BY {order} LIMIT {batch}")
+                    else:
+                        read.execute(f"SELECT {select_cols} FROM {tname} "
+                                     f"WHERE {keyset} ORDER BY {order} LIMIT {batch}", last)
+                    rows = read.fetchall()
                     if not rows:
                         break
                     for row in rows:
                         key_vals = row[: len(pk)]
-                        col_vals = row[len(pk) :]
-                        updates = {}
-                        for col, val in zip(columns, col_vals):
-                            if val is None or old not in val:
-                                continue
-                            new_val = replace_serialized(val, old, new)
-                            if new_val != val:
-                                updates[col] = new_val
+                        updates = _cell_updates(columns, row[len(pk):], old, new)
                         if not updates:
                             continue
                         changed_cells += len(updates)
-                        changed_tables[table.decode()] = (
-                            changed_tables.get(table.decode(), 0) + len(updates)
-                        )
+                        changed_tables[tdec] = changed_tables.get(tdec, 0) + len(updates)
                         if dry_run:
                             continue
                         set_clause = ", ".join(f"{_ident(c)} = %s" for c in updates)
@@ -541,8 +561,11 @@ def search_replace(cfg: DBConfig, old: bytes, new: bytes, dry_run: bool = False)
                             f"UPDATE {tname} SET {set_clause} WHERE {where_clause}",
                             tuple(updates.values()) + tuple(key_vals),
                         )
-        if not dry_run:
-            conn.commit()
+                    last = tuple(rows[-1][: len(pk)])
+                    if len(rows) < batch:
+                        break
+            if not dry_run:
+                conn.commit()
     finally:
         conn.close()
 
@@ -605,6 +628,8 @@ def main(argv=None) -> int:
     ps.add_argument("old")
     ps.add_argument("new")
     ps.add_argument("--dry-run", action="store_true")
+    ps.add_argument("--batch", type=int, default=1000,
+                    help="rows fetched per keyset page (lower it if a table has huge cells)")
     _add_db_args(ps)
 
     pm = sub.add_parser("migrate", help="extract + import-db + search-replace")
@@ -629,7 +654,7 @@ def main(argv=None) -> int:
         return 0
 
     if a.cmd == "search-replace":
-        search_replace(_cfg(a), a.old.encode(), a.new.encode(), a.dry_run)
+        search_replace(_cfg(a), a.old.encode(), a.new.encode(), a.dry_run, a.batch)
         return 0
 
     if a.cmd == "migrate":

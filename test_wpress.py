@@ -199,5 +199,67 @@ fixed = wm.replace_serialized(ser, b"SERVMASK_PREFIX_", b"wp_")
 check("prefix inside serialized value -> length recomputed",
       php.loads(fixed, decode_strings=False) == {b"k": b"wp_options"})
 
+# ---------------------------------------------------------------------------
+# 5. search_replace keyset pagination (fake DB; no live MySQL needed).
+#    Proves it walks every row across batches, advances, and applies updates.
+# ---------------------------------------------------------------------------
+class FakeCursor:
+    def __init__(self, db): self.db = db; self._result = []
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def execute(self, sql, params=None):
+        s = " ".join(sql.split())
+        if s.startswith("SELECT"):
+            limit = int(s.rsplit("LIMIT", 1)[1])
+            rows = sorted(self.db, key=lambda r: r[0])
+            if "WHERE" in s:                      # keyset resume: (pk) > (last)
+                rows = [r for r in rows if r[0] > params[0]]
+            self._result = [(r[0], r[1]) for r in rows[:limit]]
+        elif s.startswith("UPDATE"):              # SET `val`=%s WHERE `pk`=%s
+            new_value, pk_value = params[0], params[1]
+            for i, r in enumerate(self.db):
+                if r[0] == pk_value:
+                    self.db[i] = (r[0], new_value)
+    def fetchall(self): return self._result
+
+class FakeConn:
+    def __init__(self, db): self.db = db; self.committed = False
+    def cursor(self): return FakeCursor(self.db)
+    def commit(self): self.committed = True
+    def close(self): pass
+
+OLD2, NEW2 = b"OLD", b"NEWER"   # length-changing on purpose
+def make_db():
+    return [
+        (1, b"keep OLD here"),
+        (2, b"nothing"),
+        (3, php.dumps({b"u": b"OLD"})),   # serialized -> length must be recomputed
+        (4, b"OLD and OLD"),
+        (5, b"nothing2"),
+    ]
+
+_orig_connect, _orig_cols = wm._connect, wm._string_columns
+try:
+    db = make_db()
+    wm._connect = lambda cfg: FakeConn(db)
+    wm._string_columns = lambda cur, database: iter([(b"wp_x", [b"val"], [b"pk"])])
+    cfg = wm.DBConfig("d", "u", "p")
+
+    n = wm.search_replace(cfg, OLD2, NEW2, dry_run=False, batch=2)  # batch=2 forces 3 pages
+    by_pk = dict(db)
+    check("keyset: counts all changed cells across batches", n == 3)
+    check("keyset: plain cell replaced", by_pk[1] == b"keep NEWER here")
+    check("keyset: serialized cell length recomputed",
+          php.loads(by_pk[3], decode_strings=False) == {b"u": b"NEWER"})
+    check("keyset: multi-occurrence cell replaced", by_pk[4] == b"NEWER and NEWER")
+    check("keyset: non-matching rows untouched", by_pk[2] == b"nothing" and by_pk[5] == b"nothing2")
+
+    db2 = make_db()
+    wm._connect = lambda cfg: FakeConn(db2)
+    n2 = wm.search_replace(cfg, OLD2, NEW2, dry_run=True, batch=2)
+    check("keyset: dry-run counts but does not mutate", n2 == 3 and db2 == make_db())
+finally:
+    wm._connect, wm._string_columns = _orig_connect, _orig_cols
+
 print(f"\n{PASS} passed, {FAIL} failed")
 raise SystemExit(1 if FAIL else 0)
