@@ -310,7 +310,12 @@ class DBConfig:
 
 
 def _mysql_base_args(cfg: DBConfig) -> list[str]:
-    args = ["mysql", f"-u{cfg.user}", f"-p{cfg.password}", cfg.database]
+    # --default-character-set=utf8mb4 is essential: the AIO database.sql is a
+    # stripped dump with no `SET NAMES`, so without this the client negotiates
+    # utf8mb3 (or latin1) and any 4-byte char (emoji, e.g. 🛒 = \xF0\x9F\x9B\x92)
+    # triggers "ERROR 1366 Incorrect string value" mid-import.
+    args = ["mysql", "--default-character-set=utf8mb4",
+            f"-u{cfg.user}", f"-p{cfg.password}", cfg.database]
     if cfg.socket:
         args.insert(1, f"--socket={cfg.socket}")
     else:
