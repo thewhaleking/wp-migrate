@@ -4,3 +4,8 @@ version = "0.1.0"
 description = "Tools for extracting and migrating a Wordpress site using the All In One Wordpress plugin"
 requires-python = ">=3.10"
 dependencies = []
+
+[project.optional-dependencies]
+# Only needed for the database subcommands (import-db / search-replace / migrate);
+# `extract` runs on the standard library alone. Install with: pip install ".[db]"
+db = ["PyMySQL>=1.0"]
