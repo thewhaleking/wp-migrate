@@ -323,16 +323,75 @@ def _mysql_base_args(cfg: DBConfig) -> list[str]:
     return args
 
 
+def _is_hex_digit(b: int) -> bool:
+    return 0x30 <= b <= 0x39 or 0x41 <= b <= 0x46 or 0x61 <= b <= 0x66
+
+
+def fix_empty_hex(line: bytes) -> tuple[bytes, int]:
+    """Rewrite bare `0x` empty-hex literals to '' outside of quoted text.
+
+    All-in-One WP Migration emits `0x` for an empty BLOB (common in Wordfence's
+    wfConfig). MySQL rejects a bare `0x` ("Unknown column '0x'") because a real
+    hex literal is always `0x` followed by digits. We replace it with '' — but
+    only when we're outside a '...' string or `...` identifier, so string data
+    that merely contains the text "0x" is never touched. Returns the rewritten
+    line and how many literals were fixed. Statements live on one line each in an
+    AIO dump, so per-line scanning never splits a value.
+    """
+    if b"0x" not in line:
+        return line, 0
+    out = bytearray()
+    i, n, fixes = 0, len(line), 0
+    quote = 0  # 0 = outside; otherwise the quote byte we're inside (0x27 ' or 0x60 `)
+    while i < n:
+        c = line[i]
+        if quote:
+            out.append(c)
+            if c == 0x5C and quote == 0x27 and i + 1 < n:  # backslash escape in '...'
+                out.append(line[i + 1]); i += 2; continue
+            if c == quote:
+                if i + 1 < n and line[i + 1] == quote:    # doubled quote = literal
+                    out.append(line[i + 1]); i += 2; continue
+                quote = 0
+            i += 1
+            continue
+        if c == 0x27 or c == 0x60:  # entering ' or `
+            quote = c; out.append(c); i += 1; continue
+        if c == 0x30 and i + 1 < n and line[i + 1] == 0x78:  # '0' 'x'
+            if i + 2 >= n or not _is_hex_digit(line[i + 2]):  # not a real hex literal
+                out += b"''"; fixes += 1; i += 2; continue
+        out.append(c); i += 1
+    return bytes(out), fixes
+
+
 def import_db(sql_path: str, cfg: DBConfig) -> None:
-    """Stream a .sql dump into MySQL via the client binary."""
+    """Stream a .sql dump into MySQL via the client binary.
+
+    The dump is piped through line by line (statements are one-per-line in an AIO
+    export) so we can repair `0x` empty-hex literals on the fly without splitting
+    statements. Line numbering is preserved, so any `mysql` "ERROR ... at line N"
+    still points at the right line of the original file.
+    """
     if not os.path.exists(sql_path):
         raise FileNotFoundError(sql_path)
     size = os.path.getsize(sql_path)
     print(f"Importing {sql_path} ({size:,} bytes) into `{cfg.database}` ...")
-    with open(sql_path, "rb") as fh:
-        proc = subprocess.run(_mysql_base_args(cfg), stdin=fh)
-    if proc.returncode != 0:
-        raise RuntimeError(f"mysql import failed (exit {proc.returncode})")
+    proc = subprocess.Popen(_mysql_base_args(cfg), stdin=subprocess.PIPE)
+    total_fixes = 0
+    try:
+        with open(sql_path, "rb") as fh:
+            for line in fh:
+                fixed, k = fix_empty_hex(line)
+                total_fixes += k
+                proc.stdin.write(fixed)
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass  # mysql died early; the real error is on its stderr / returncode
+    returncode = proc.wait()
+    if returncode != 0:
+        raise RuntimeError(f"mysql import failed (exit {returncode})")
+    if total_fixes:
+        print(f"  (repaired {total_fixes:,} empty-hex `0x` literal(s) -> '')")
     print("Import complete.")
 
 

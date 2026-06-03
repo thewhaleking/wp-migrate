@@ -146,5 +146,29 @@ plain = b"just text http://old.example.com end"
 check("non-serialized falls back to plain replace",
       wm.replace_serialized(plain, OLD, NEW) == plain.replace(OLD, NEW))
 
+# ---------------------------------------------------------------------------
+# 3. fix_empty_hex: AIO's `0x` empty-blob literal -> '' (string-aware).
+# ---------------------------------------------------------------------------
+def fx(line):
+    return wm.fix_empty_hex(line)
+
+# the exact failing statement from the field report
+real = b"INSERT INTO `SERVMASK_PREFIX_wfConfig` VALUES ('lastScanFailureType',0x,'yes')\n"
+check("empty hex 0x replaced with ''",
+      fx(real) == (b"INSERT INTO `SERVMASK_PREFIX_wfConfig` VALUES ('lastScanFailureType','',"
+                   b"'yes')\n", 1))
+check("real hex literal left intact", fx(b"VALUES (1,0x4142,'x')\n") == (b"VALUES (1,0x4142,'x')\n", 0))
+check("0x inside a string is untouched", fx(b"VALUES ('foo 0x bar')\n") == (b"VALUES ('foo 0x bar')\n", 0))
+check("0x with delimiters inside a string is untouched",
+      fx(b"VALUES ('a,0x,b')\n") == (b"VALUES ('a,0x,b')\n", 0))
+check("0x inside a backtick identifier is untouched",
+      fx(b"INSERT INTO `t0x` VALUES (0x)\n") == (b"INSERT INTO `t0x` VALUES ('')\n", 1))
+check("multiple empty-hex on one line", fx(b"VALUES (0x,0x,'k')\n") == (b"VALUES ('','','k')\n", 2))
+check("doubled-quote string then empty hex",
+      fx(b"VALUES ('it''s',0x)\n") == (b"VALUES ('it''s','')\n", 1))
+check("backslash-escaped quote then string-internal 0x untouched, outer fixed",
+      fx(b"VALUES ('a\\' 0x z',0x)\n") == (b"VALUES ('a\\' 0x z','')\n", 1))
+check("line without 0x is a no-op", fx(b"VALUES (1,2,3)\n") == (b"VALUES (1,2,3)\n", 0))
+
 print(f"\n{PASS} passed, {FAIL} failed")
 raise SystemExit(1 if FAIL else 0)
