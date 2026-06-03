@@ -1,0 +1,6 @@
+[project]
+name = "wp-migrate"
+version = "0.1.0"
+description = "Tools for extracting and migrating a Wordpress site using the All In One Wordpress plugin"
+requires-python = ">=3.10"
+dependencies = []
