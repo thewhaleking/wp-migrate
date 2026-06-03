@@ -170,5 +170,34 @@ check("backslash-escaped quote then string-internal 0x untouched, outer fixed",
       fx(b"VALUES ('a\\' 0x z',0x)\n") == (b"VALUES ('a\\' 0x z','')\n", 1))
 check("line without 0x is a no-op", fx(b"VALUES (1,2,3)\n") == (b"VALUES (1,2,3)\n", 0))
 
+# ---------------------------------------------------------------------------
+# 4. --table-prefix: rewrite SERVMASK_PREFIX_ in identifiers (stream) and in
+#    row data (serialization-safe, second pass).
+# ---------------------------------------------------------------------------
+def px(line, src=b"SERVMASK_PREFIX_", dst=b"wp_"):
+    return wm._scan_sql_line(line, src, dst)
+
+# Backtick identifier renamed; the SAME placeholder inside quoted data is left
+# for the serialization-safe pass; bare 0x still repaired. (returns (line,hex,pref))
+ins = b"INSERT INTO `SERVMASK_PREFIX_usermeta` VALUES (1,5,'SERVMASK_PREFIX_capabilities',0x)\n"
+check("prefix: identifier renamed, quoted data untouched, hex fixed",
+      px(ins) == (b"INSERT INTO `wp_usermeta` VALUES (1,5,'SERVMASK_PREFIX_capabilities','')\n", 1, 1))
+check("prefix: DROP identifier renamed",
+      px(b"DROP TABLE IF EXISTS `SERVMASK_PREFIX_posts`;\n")
+      == (b"DROP TABLE IF EXISTS `wp_posts`;\n", 0, 1))
+check("prefix: no rewrite when src==dst",
+      wm._scan_sql_line(b"INSERT INTO `wp_x` VALUES (1)\n", b"wp_", b"wp_") == (b"INSERT INTO `wp_x` VALUES (1)\n", 0, 0))
+check("fix_empty_hex wrapper still returns 2-tuple",
+      wm.fix_empty_hex(b"VALUES (0x)\n") == (b"VALUES ('')\n", 1))
+
+# Data-side: the serialization-safe engine fixes embedded prefix refs, including
+# inside serialized blobs where the byte length must be recomputed.
+check("prefix in plain value -> plain replace",
+      wm.replace_serialized(b"SERVMASK_PREFIX_capabilities", b"SERVMASK_PREFIX_", b"wp_") == b"wp_capabilities")
+ser = php.dumps({b"k": b"SERVMASK_PREFIX_options"})
+fixed = wm.replace_serialized(ser, b"SERVMASK_PREFIX_", b"wp_")
+check("prefix inside serialized value -> length recomputed",
+      php.loads(fixed, decode_strings=False) == {b"k": b"wp_options"})
+
 print(f"\n{PASS} passed, {FAIL} failed")
 raise SystemExit(1 if FAIL else 0)

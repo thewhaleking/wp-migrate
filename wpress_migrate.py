@@ -19,10 +19,10 @@ client binary on PATH (only for `import-db` / `migrate`).
 
 Usage:
     wpress_migrate.py extract        ARCHIVE.wpress -o OUTDIR
-    wpress_migrate.py import-db      OUTDIR/database.sql --db NAME --user U --password P
+    wpress_migrate.py import-db      OUTDIR/database.sql --db NAME --user U --password P [--table-prefix wp_]
     wpress_migrate.py search-replace --db NAME --user U --password P OLD NEW [--dry-run]
     wpress_migrate.py migrate        ARCHIVE.wpress -o OUTDIR --db NAME --user U --password P \\
-                                     --old-url https://old.com --new-url https://new.com
+                                     --old-url https://old.com --new-url https://new.com [--table-prefix wp_]
 
 Run any subcommand with -h for its full options.
 """
@@ -327,25 +327,37 @@ def _is_hex_digit(b: int) -> bool:
     return 0x30 <= b <= 0x39 or 0x41 <= b <= 0x46 or 0x61 <= b <= 0x66
 
 
-def fix_empty_hex(line: bytes) -> tuple[bytes, int]:
-    """Rewrite bare `0x` empty-hex literals to '' outside of quoted text.
+SERVMASK_PREFIX = b"SERVMASK_PREFIX_"  # AIO's table-prefix placeholder
 
-    All-in-One WP Migration emits `0x` for an empty BLOB (common in Wordfence's
-    wfConfig). MySQL rejects a bare `0x` ("Unknown column '0x'") because a real
-    hex literal is always `0x` followed by digits. We replace it with '' — but
-    only when we're outside a '...' string or `...` identifier, so string data
-    that merely contains the text "0x" is never touched. Returns the rewritten
-    line and how many literals were fixed. Statements live on one line each in an
-    AIO dump, so per-line scanning never splits a value.
+
+def _scan_sql_line(line: bytes, src_prefix: bytes | None = None,
+                   dst_prefix: bytes | None = None) -> tuple[bytes, int, int]:
+    """Repair one SQL line from an AIO dump, returning (line, hex_fixes, prefix_fixes).
+
+    1. Bare `0x` empty-hex literals -> '' (only outside quotes). AIO emits `0x`
+       for an empty BLOB; MySQL rejects it ("Unknown column '0x'") because a real
+       hex literal is always `0x` followed by digits.
+    2. If src/dst prefixes are given, rewrite the table-name placeholder, but
+       ONLY inside `backtick` identifiers. The same placeholder embedded in row
+       data (single-quoted strings, which may be PHP-serialized) is deliberately
+       left untouched here and fixed afterward by the serialization-safe
+       search-replace, which recomputes s:<len> prefixes when the length changes.
+
+    Statements are one-per-line in an AIO dump, so per-line scanning never splits
+    a value, and line numbering is preserved for `mysql` error messages.
     """
-    if b"0x" not in line:
-        return line, 0
+    do_prefix = bool(src_prefix) and bool(dst_prefix) and src_prefix != dst_prefix
+    if b"0x" not in line and not (do_prefix and src_prefix in line):
+        return line, 0, 0
+    plen = len(src_prefix) if do_prefix else 0
     out = bytearray()
-    i, n, fixes = 0, len(line), 0
+    i, n, hexf, preff = 0, len(line), 0, 0
     quote = 0  # 0 = outside; otherwise the quote byte we're inside (0x27 ' or 0x60 `)
     while i < n:
         c = line[i]
         if quote:
+            if quote == 0x60 and do_prefix and line[i:i + plen] == src_prefix:
+                out += dst_prefix; preff += 1; i += plen; continue  # rename inside `...`
             out.append(c)
             if c == 0x5C and quote == 0x27 and i + 1 < n:  # backslash escape in '...'
                 out.append(line[i + 1]); i += 2; continue
@@ -359,30 +371,43 @@ def fix_empty_hex(line: bytes) -> tuple[bytes, int]:
             quote = c; out.append(c); i += 1; continue
         if c == 0x30 and i + 1 < n and line[i + 1] == 0x78:  # '0' 'x'
             if i + 2 >= n or not _is_hex_digit(line[i + 2]):  # not a real hex literal
-                out += b"''"; fixes += 1; i += 2; continue
+                out += b"''"; hexf += 1; i += 2; continue
         out.append(c); i += 1
-    return bytes(out), fixes
+    return bytes(out), hexf, preff
 
 
-def import_db(sql_path: str, cfg: DBConfig) -> None:
+def fix_empty_hex(line: bytes) -> tuple[bytes, int]:
+    """Repair `0x` empty-hex literals only (see _scan_sql_line)."""
+    new, hexf, _ = _scan_sql_line(line)
+    return new, hexf
+
+
+def import_db(sql_path: str, cfg: DBConfig, table_prefix: str | None = None,
+              src_prefix: bytes = SERVMASK_PREFIX) -> None:
     """Stream a .sql dump into MySQL via the client binary.
 
-    The dump is piped through line by line (statements are one-per-line in an AIO
-    export) so we can repair `0x` empty-hex literals on the fly without splitting
-    statements. Line numbering is preserved, so any `mysql` "ERROR ... at line N"
-    still points at the right line of the original file.
+    The dump is piped through line by line so we can repair `0x` empty-hex
+    literals on the fly without splitting statements. When `table_prefix` is set,
+    AIO's `SERVMASK_PREFIX_` placeholder is rewritten to it: table names during
+    this stream, and prefix references embedded in row data afterward via the
+    serialization-safe search-replace (so serialized lengths stay correct).
     """
     if not os.path.exists(sql_path):
         raise FileNotFoundError(sql_path)
+    dst = table_prefix.encode() if table_prefix else None
+    rename = dst is not None and dst != src_prefix
     size = os.path.getsize(sql_path)
     print(f"Importing {sql_path} ({size:,} bytes) into `{cfg.database}` ...")
+    if rename:
+        print(f"  rewriting table prefix `{src_prefix.decode()}` -> `{table_prefix}`")
     proc = subprocess.Popen(_mysql_base_args(cfg), stdin=subprocess.PIPE)
-    total_fixes = 0
+    total_hex = total_pref = 0
     try:
         with open(sql_path, "rb") as fh:
             for line in fh:
-                fixed, k = fix_empty_hex(line)
-                total_fixes += k
+                fixed, hx, px = _scan_sql_line(line, src_prefix if rename else None, dst)
+                total_hex += hx
+                total_pref += px
                 proc.stdin.write(fixed)
         proc.stdin.close()
     except BrokenPipeError:
@@ -390,9 +415,20 @@ def import_db(sql_path: str, cfg: DBConfig) -> None:
     returncode = proc.wait()
     if returncode != 0:
         raise RuntimeError(f"mysql import failed (exit {returncode})")
-    if total_fixes:
-        print(f"  (repaired {total_fixes:,} empty-hex `0x` literal(s) -> '')")
+    if total_hex:
+        print(f"  (repaired {total_hex:,} empty-hex `0x` literal(s) -> '')")
+    if total_pref:
+        print(f"  (renamed {total_pref:,} table identifier(s) to `{table_prefix}`)")
     print("Import complete.")
+
+    if rename:
+        # The placeholder also lives inside row data — usermeta keys like
+        # `{prefix}capabilities`, the `{prefix}user_roles` option, and possibly
+        # serialized blobs. Fix those length-safely with the same engine used for
+        # URL rewriting.
+        print(f"Rewriting embedded `{src_prefix.decode()}` references in row data "
+              "(serialization-safe) ...")
+        search_replace(cfg, src_prefix, dst)
 
 
 def _connect(cfg: DBConfig):
@@ -535,6 +571,17 @@ def _cfg(a) -> DBConfig:
     return DBConfig(a.db, a.user, a.password, a.host, a.port, a.socket)
 
 
+def _check_prefix(p: str | None) -> None:
+    """Validate a --table-prefix value (it lands in SQL identifiers)."""
+    if p is None:
+        return
+    if not p or any(not (c.isascii() and (c.isalnum() or c == "_")) for c in p):
+        raise SystemExit(f"--table-prefix must be ASCII letters/digits/underscore, got {p!r}")
+    if not p.endswith("_"):
+        print(f"warning: table prefix {p!r} doesn't end with '_' "
+              "(WordPress convention is e.g. 'wp_')", file=sys.stderr)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="wpress-migrate", description=__doc__,
@@ -550,6 +597,8 @@ def main(argv=None) -> int:
 
     pi = sub.add_parser("import-db", help="stream database.sql into MySQL")
     pi.add_argument("sql")
+    pi.add_argument("--table-prefix", default=None,
+                    help="rewrite AIO's SERVMASK_PREFIX_ placeholder to this prefix (e.g. wp_)")
     _add_db_args(pi)
 
     ps = sub.add_parser("search-replace", help="serialization-safe string replace")
@@ -563,6 +612,8 @@ def main(argv=None) -> int:
     pm.add_argument("-o", "--outdir", default="wpress-extracted")
     pm.add_argument("--old-url", required=True)
     pm.add_argument("--new-url", required=True)
+    pm.add_argument("--table-prefix", default=None,
+                    help="rewrite AIO's SERVMASK_PREFIX_ placeholder to this prefix (e.g. wp_)")
     pm.add_argument("--dry-run", action="store_true")
     _add_db_args(pm)
 
@@ -573,7 +624,8 @@ def main(argv=None) -> int:
         return 0
 
     if a.cmd == "import-db":
-        import_db(a.sql, _cfg(a))
+        _check_prefix(a.table_prefix)
+        import_db(a.sql, _cfg(a), a.table_prefix)
         return 0
 
     if a.cmd == "search-replace":
@@ -581,18 +633,20 @@ def main(argv=None) -> int:
         return 0
 
     if a.cmd == "migrate":
+        _check_prefix(a.table_prefix)
         print("== 1/3 extract ==")
         extract(a.archive, a.outdir, verbose=False)
         sql = os.path.join(a.outdir, "database.sql")
         print(f"   files in {a.outdir}; database at {sql}")
         print("== 2/3 import database ==")
-        import_db(sql, _cfg(a))
+        import_db(sql, _cfg(a), a.table_prefix)
         print("== 3/3 search-replace ==")
         search_replace(_cfg(a), a.old_url.encode(), a.new_url.encode(), a.dry_run)
+        prefix = a.table_prefix or SERVMASK_PREFIX.decode()
         print(
             "\nNext steps (manual):\n"
             f"  1. Copy {a.outdir}/uploads, /themes, /plugins into your WP wp-content/\n"
-            "  2. Set $table_prefix in wp-config.php to match the imported tables\n"
+            f"  2. Set $table_prefix = '{prefix}'; in wp-config.php\n"
             "  3. Flush permalinks: `wp rewrite flush --hard` (or Settings > Permalinks > Save)\n"
         )
         return 0
